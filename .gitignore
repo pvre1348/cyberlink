@@ -1,4 +1,6 @@
-policelink.db
+﻿.streamlit/secrets.toml
 __pycache__/
+*.pyc
 *.zip
-venv/
+policelink.db
+supabase_keys.txt

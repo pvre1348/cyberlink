@@ -1,13 +1,13 @@
-# ตั้งค่าธีมของแอป — บังคับให้เป็นโหมดสว่างเสมอ ไม่ว่าเครื่องผู้ใช้จะตั้งเป็นโหมดมืดก็ตาม
-# นี่คือสิ่งที่แก้ปัญหา "ตัวหนังสือจาง / ช่องกรอกดำ / อ่านยาก"
+# ธีมมืดสไตล์ ArcGIS Dashboards ของ Esri
+# สีฟ้าสัญลักษณ์ Esri #0079C1 เป็นสีนำ, พื้นเข้มไม่ดำสนิทเพื่อไม่ล้าตา
 
 [theme]
-base = "light"
-primaryColor = "#E0533D"            # สีส้มสัญญาณ (ปุ่ม/ไฮไลต์)
-backgroundColor = "#FFFFFF"         # พื้นหลังหลัก (ขาว)
-secondaryBackgroundColor = "#F1F4F9" # พื้นหลังรอง (เทาอ่อน) เช่น sidebar, การ์ด
-textColor = "#14233D"               # สีตัวอักษรหลัก (กรมท่าเข้ม อ่านง่าย)
+base = "dark"
+primaryColor = "#0079C1"                # สีฟ้า Esri (ปุ่ม/ไฮไลต์)
+backgroundColor = "#1B2735"             # พื้นหลังเนื้อหา (เข้ม-น้ำเงินเทา)
+secondaryBackgroundColor = "#172230"    # sidebar และพื้นการ์ด
+textColor = "#F0F4F9"                   # ตัวหนังสือหลัก (ขาวออกฟ้าเล็กน้อย)
 font = "sans serif"
 
 [client]
-toolbarMode = "minimal"             # ซ่อนเมนู Deploy/รก ๆ ด้านบนให้สะอาดตา
+toolbarMode = "minimal"

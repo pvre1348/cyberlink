@@ -178,25 +178,35 @@ PHYSICAL_CASES = [
 ]
 
 
-def reset_and_seed():
-    if os.path.exists(db.DB_PATH):
-        os.remove(db.DB_PATH)
-    db.init_db()
-
+def _main_centroid():
     main = next((b for b in BOUNDARIES if b["is_main"]), BOUNDARIES[0])
-    main_c = centroid(main["polygon"])
-    cen = {}
+    return centroid(main["polygon"])
+
+
+def ensure_base_data():
+    """สร้างโครงพื้นฐาน (สถานี + ขอบเขต) ครั้งแรกถ้าฐานข้อมูลยังว่าง
+    ไม่ยุ่งกับข้อมูลคดี — เรียกตอนเปิดแอป"""
+    if not db.stations_empty():
+        return
+    main_c = _main_centroid()
     for b in BOUNDARIES:
         c = centroid(b["polygon"])
-        cen[b["code"]] = c
         d = "กลาง" if b["is_main"] else direction_from(main_c, c)
         db.add_station(b["code"], b["name"], d, c[0], c[1], b["is_main"])
     db.set_boundaries(BOUNDARIES)
 
+
+def load_demo():
+    """โหลดคดีตัวอย่าง + จุดเสี่ยง (ปุ่ม admin) — สร้างโครงพื้นฐานให้ก่อนถ้ายังไม่มี"""
+    ensure_base_data()
+    cen = {b["code"]: centroid(b["polygon"]) for b in BOUNDARIES}
+    main_c = _main_centroid()
     sid = {s["code"]: s["station_id"] for s in db.get_stations()}
 
     def insert(rows, category):
         for i, r in enumerate(rows):
+            if r["station"] not in sid:
+                continue
             c = cen.get(r["station"], main_c)
             off = 0.0012 * (i + 1)
             db.add_case(
@@ -211,13 +221,17 @@ def reset_and_seed():
 
     insert(CYBER_CASES, "cyber")
     insert(PHYSICAL_CASES, "physical")
-
     db.add_risk_point("physical", "แยกราชประสงค์", 13.7341, 100.5398, "สูง", "ชุมนุม/ความวุ่นวายบ่อย")
     db.add_risk_point("physical", "สวนลุมพินี (ฝั่งวิทยุ)", 13.7300, 100.5440, "ปานกลาง", "ชิงทรัพย์ช่วงดึก")
     db.add_risk_point("cyber", "ย่านปทุมวัน", main_c[0], main_c[1], "ปานกลาง", "เป้าหมายมวลชนสัมพันธ์")
 
-    print("seed:", len(CYBER_CASES), "ไซเบอร์ /", len(PHYSICAL_CASES), "พื้นที่ /",
-          len(BOUNDARIES), "พื้นที่ขอบเขต")
+
+def clear_data():
+    """ล้างเฉพาะคดี + จุดร่วม + จุดเสี่ยง (เก็บผู้ใช้/สถานี/ขอบเขตไว้)"""
+    client = db.sb()
+    client.table("indicators").delete().neq("indicator_id", -1).execute()
+    client.table("cases").delete().neq("case_id", -1).execute()
+    client.table("risk_points").delete().neq("point_id", -1).execute()
 
 
 if __name__ == "__main__":

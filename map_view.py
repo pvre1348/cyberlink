@@ -139,3 +139,19 @@ def simple_points_map(points, center=None):
                             fill=True, fill_color=col, fill_opacity=0.7,
                             tooltip=p.get("name", "")).add_to(m)
     return m
+
+
+def pick_location_map(boundaries, current_lat=None, current_lng=None):
+    """แผนที่สำหรับให้ผู้ใช้คลิกเลือกตำแหน่ง (ใช้ในฟอร์มบันทึกคดี)
+    - แสดงเส้นขอบพื้นที่ทุก สน. เป็นพื้นหลังให้เห็นว่าอยู่พื้นที่ไหน
+    - ถ้ามีพิกัดปัจจุบัน (แก้ไขคดี) จะปักหมุดที่ตำแหน่งเดิมให้เห็น
+    - ผู้ใช้คลิกที่ใดในแผนที่ = พิกัดถูกส่งกลับผ่าน st_folium
+    """
+    m = _base_map(boundaries)
+    if current_lat is not None and current_lng is not None:
+        folium.Marker(
+            [current_lat, current_lng],
+            tooltip="ตำแหน่งปัจจุบัน (คลิกที่อื่นเพื่อย้าย)",
+            icon=folium.Icon(color="red", icon="map-pin", prefix="fa"),
+        ).add_to(m)
+    return m

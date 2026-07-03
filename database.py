@@ -1,19 +1,14 @@
 """
-database.py — ฐานข้อมูลระบบ CyberLink / PatrolLink
-รองรับ 2 กลุ่มคดี:
-  - cyber    : อาชญากรรมไซเบอร์ (เชื่อมโยงด้วย บัญชี/ไลน์/เบอร์) -> ใช้ทำมวลชนสัมพันธ์
-  - physical : คดีในพื้นที่ ลัก/วิ่งราว/ชิง/ปล้น/จลาจล (เชื่อมโยงด้วย ทะเบียนรถ/ลักษณะคนร้าย) -> ใช้บริหารสายตรวจ
-
-แนวคิดในรายวิชาที่ใช้: ตัวแปร/ชนิดข้อมูล, if-else, for loop, ฟังก์ชัน,
-list/dict/set, การจัดการฐานข้อมูล (sqlite3), การอ่าน/เขียนไฟล์ (import KML)
+database.py — ชั้นข้อมูลของ CyberLink (เวอร์ชัน Supabase / PostgreSQL)
+คงชื่อฟังก์ชันเดิมทั้งหมดไว้ เพื่อให้ app.py ใช้งานได้เหมือนตอนเป็น SQLite
+ตรรกะที่ซับซ้อน (เชื่อมโยงคดี, สรุปพื้นที่เสี่ยง) คำนวณฝั่ง Python เพราะข้อมูลไม่ใหญ่
 """
-import sqlite3
 import re
 import json
 
-DB_PATH = "policelink.db"
+import supa
 
-# ป้ายชื่อชนิดจุดร่วม
+# ---------------- ป้ายชื่อจุดร่วม ----------------
 INDICATOR_LABELS = {
     "bank_account": "เลขบัญชีธนาคาร",
     "account_name": "ชื่อบัญชี",
@@ -24,79 +19,19 @@ INDICATOR_LABELS = {
     "suspect_desc": "ลักษณะคนร้าย",
     "other": "อื่น ๆ",
 }
-# จุดร่วมที่ใช้ในแต่ละกลุ่มคดี
 CYBER_INDICATORS = ["bank_account", "account_name", "phone", "line_id", "url", "other"]
 PHYSICAL_INDICATORS = ["vehicle_plate", "suspect_desc", "phone", "other"]
 
-
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+CASE_FIELDS = ("case_number", "station_id", "category", "crime_type", "report_date",
+               "time_bucket", "area", "location_detail", "lat", "lng",
+               "victim_name", "damage_amount", "weapon", "severity", "mo_description")
 
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS stations (
-            station_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            direction TEXT,
-            lat REAL, lng REAL,
-            is_main INTEGER DEFAULT 0
-        )""")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS cases (
-            case_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            case_number TEXT NOT NULL,
-            station_id INTEGER NOT NULL,
-            category TEXT NOT NULL,             -- cyber | physical
-            crime_type TEXT NOT NULL,
-            report_date TEXT NOT NULL,
-            time_bucket TEXT,                   -- เช้า/บ่าย/ค่ำ/ดึก
-            area TEXT,
-            location_detail TEXT,
-            lat REAL, lng REAL,
-            victim_name TEXT,
-            damage_amount REAL DEFAULT 0,
-            weapon TEXT,
-            severity INTEGER DEFAULT 1,         -- 1-3 ความรุนแรง (ใช้ถ่วงน้ำหนักความเสี่ยง)
-            mo_description TEXT,
-            status TEXT DEFAULT 'open',
-            created_at TEXT DEFAULT (datetime('now','localtime')),
-            FOREIGN KEY (station_id) REFERENCES stations(station_id)
-        )""")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS indicators (
-            indicator_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            case_id INTEGER NOT NULL,
-            indicator_type TEXT NOT NULL,
-            raw_value TEXT NOT NULL,
-            norm_value TEXT NOT NULL,
-            FOREIGN KEY (case_id) REFERENCES cases(case_id)
-        )""")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS risk_points (
-            point_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,             -- cyber | physical
-            name TEXT NOT NULL,
-            lat REAL NOT NULL, lng REAL NOT NULL,
-            level TEXT DEFAULT 'ปานกลาง',       -- สูง/ปานกลาง/ต่ำ
-            note TEXT
-        )""")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )""")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ind ON indicators(indicator_type, norm_value)")
-    conn.commit()
-    conn.close()
+def sb():
+    return supa.service_client()
 
 
-# ---------- normalize ----------
+# ---------------- normalize ----------------
 def normalize_value(indicator_type, value):
     if value is None:
         return ""
@@ -110,36 +45,19 @@ def normalize_value(indicator_type, value):
     return re.sub(r"\s+", " ", v).strip().lower()
 
 
-# ---------- settings (เก็บขอบเขตแผนที่) ----------
+# ---------------- settings / boundaries ----------------
 def set_setting(key, value):
-    conn = get_conn()
-    conn.execute("INSERT INTO settings(key,value) VALUES(?,?) "
-                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
-    conn.commit()
-    conn.close()
+    sb().table("settings").upsert({"key": key, "value": value}).execute()
 
 
 def get_setting(key, default=None):
-    conn = get_conn()
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    conn.close()
-    return row["value"] if row else default
-
-
-def get_boundary():
-    """(คงไว้เพื่อความเข้ากันได้) คืนเฉพาะ polygon ทั้งหมดแบบไม่มีชื่อ"""
-    return [a["polygon"] for a in get_boundaries()]
-
-
-def set_boundary(polygons):
-    """(คงไว้เพื่อความเข้ากันได้) เก็บ polygon เป็นพื้นที่ไม่มีชื่อ"""
-    areas = [{"code": f"พื้นที่ {i+1}", "name": "", "is_main": 0, "polygon": p}
-             for i, p in enumerate(polygons)]
-    set_boundaries(areas)
+    r = sb().table("settings").select("value").eq("key", key).execute()
+    if r.data:
+        return r.data[0]["value"]
+    return default
 
 
 def get_boundaries():
-    """คืนรายการขอบเขตแบบมีชื่อ: [{code,name,is_main,polygon}, ...]"""
     raw = get_setting("boundaries")
     if not raw:
         return []
@@ -150,77 +68,65 @@ def get_boundaries():
 
 
 def set_boundaries(areas):
-    """บันทึกรายการขอบเขตหลาย สน. (แต่ละอันมี code/name/is_main/polygon)"""
     set_setting("boundaries", json.dumps(areas, ensure_ascii=False))
 
 
-# ---------- stations ----------
+# คงไว้เพื่อความเข้ากันได้ (โค้ดเก่าบางส่วนเรียก)
+def get_boundary():
+    return [a["polygon"] for a in get_boundaries()]
+
+
+def set_boundary(polygons):
+    set_boundaries([{"code": f"พื้นที่ {i+1}", "name": "", "is_main": 0, "polygon": p}
+                    for i, p in enumerate(polygons)])
+
+
+# ---------------- stations ----------------
 def add_station(code, name, direction="", lat=None, lng=None, is_main=0):
-    conn = get_conn()
-    try:
-        conn.execute("INSERT INTO stations(code,name,direction,lat,lng,is_main) "
-                     "VALUES(?,?,?,?,?,?)", (code, name, direction, lat, lng, is_main))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    finally:
-        conn.close()
+    sb().table("stations").insert({
+        "code": code, "name": name, "direction": direction,
+        "lat": lat, "lng": lng, "is_main": int(is_main or 0)}).execute()
 
 
 def get_stations():
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM stations ORDER BY is_main DESC, code").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    r = sb().table("stations").select("*").order("is_main", desc=True).order("code").execute()
+    return r.data or []
 
 
 def save_stations(rows):
-    """บันทึกตารางสถานีทั้งหมด (ใช้กับ data_editor): ลบเก่าทิ้งแล้วเขียนใหม่"""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM stations")
+    client = sb()
+    client.table("stations").delete().neq("station_id", -1).execute()  # ลบทั้งหมด
+    payload = []
     for r in rows:
         if not (r.get("code") and r.get("name")):
             continue
-        cur.execute("INSERT INTO stations(code,name,direction,lat,lng,is_main) VALUES(?,?,?,?,?,?)",
-                    (r.get("code"), r.get("name"), r.get("direction", ""),
-                     r.get("lat"), r.get("lng"), int(r.get("is_main", 0) or 0)))
-    conn.commit()
-    conn.close()
+        payload.append({"code": r.get("code"), "name": r.get("name"),
+                        "direction": r.get("direction", ""), "lat": r.get("lat"),
+                        "lng": r.get("lng"), "is_main": int(r.get("is_main", 0) or 0)})
+    if payload:
+        client.table("stations").insert(payload).execute()
 
 
-# ---------- cases ----------
-CASE_FIELDS = ("case_number", "station_id", "category", "crime_type", "report_date",
-               "time_bucket", "area", "location_detail", "lat", "lng",
-               "victim_name", "damage_amount", "weapon", "severity", "mo_description")
-
-
-def add_case(indicators=None, **f):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(f"""INSERT INTO cases ({",".join(CASE_FIELDS)})
-                    VALUES ({",".join("?" for _ in CASE_FIELDS)})""",
-                tuple(f.get(k) for k in CASE_FIELDS))
-    case_id = cur.lastrowid
-    _write_indicators(cur, case_id, indicators or [])
-    conn.commit()
-    conn.close()
+# ---------------- cases ----------------
+def add_case(indicators=None, created_by=None, **f):
+    row = {k: f.get(k) for k in CASE_FIELDS}
+    if created_by:
+        row["created_by"] = created_by
+    r = sb().table("cases").insert(row).execute()
+    case_id = r.data[0]["case_id"]
+    _write_indicators(case_id, indicators or [])
     return case_id
 
 
 def update_case(case_id, indicators=None, **f):
-    conn = get_conn()
-    cur = conn.cursor()
-    sets = ",".join(f"{k}=?" for k in CASE_FIELDS)
-    cur.execute(f"UPDATE cases SET {sets} WHERE case_id=?",
-                tuple(f.get(k) for k in CASE_FIELDS) + (case_id,))
-    cur.execute("DELETE FROM indicators WHERE case_id=?", (case_id,))
-    _write_indicators(cur, case_id, indicators or [])
-    conn.commit()
-    conn.close()
+    row = {k: f.get(k) for k in CASE_FIELDS}
+    sb().table("cases").update(row).eq("case_id", case_id).execute()
+    sb().table("indicators").delete().eq("case_id", case_id).execute()
+    _write_indicators(case_id, indicators or [])
 
 
-def _write_indicators(cur, case_id, indicators):
+def _write_indicators(case_id, indicators):
+    payload = []
     for ind_type, raw in indicators:
         raw = (raw or "").strip()
         if not raw:
@@ -228,48 +134,49 @@ def _write_indicators(cur, case_id, indicators):
         norm = normalize_value(ind_type, raw)
         if not norm:
             continue
-        cur.execute("INSERT INTO indicators(case_id,indicator_type,raw_value,norm_value) "
-                    "VALUES(?,?,?,?)", (case_id, ind_type, raw, norm))
+        payload.append({"case_id": case_id, "indicator_type": ind_type,
+                        "raw_value": raw, "norm_value": norm})
+    if payload:
+        sb().table("indicators").insert(payload).execute()
 
 
 def delete_case(case_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM indicators WHERE case_id=?", (case_id,))
-    cur.execute("DELETE FROM cases WHERE case_id=?", (case_id,))
-    conn.commit()
-    conn.close()
+    sb().table("indicators").delete().eq("case_id", case_id).execute()
+    sb().table("cases").delete().eq("case_id", case_id).execute()
+
+
+def _station_map():
+    return {s["station_id"]: s for s in get_stations()}
+
+
+def _attach_station(case, smap):
+    s = smap.get(case.get("station_id"), {})
+    case["station_code"] = s.get("code", "")
+    case["station_name"] = s.get("name", "")
+    case["station_direction"] = s.get("direction", "")
+    return case
 
 
 def get_cases(category=None):
-    conn = get_conn()
-    sql = """SELECT c.*, s.code AS station_code, s.name AS station_name,
-                    s.direction AS station_direction
-             FROM cases c JOIN stations s ON c.station_id=s.station_id"""
-    params = ()
+    q = sb().table("cases").select("*")
     if category:
-        sql += " WHERE c.category=?"
-        params = (category,)
-    sql += " ORDER BY c.report_date DESC, c.case_id DESC"
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+        q = q.eq("category", category)
+    r = q.order("report_date", desc=True).order("case_id", desc=True).execute()
+    smap = _station_map()
+    return [_attach_station(dict(c), smap) for c in (r.data or [])]
 
 
 def get_case(case_id):
-    conn = get_conn()
-    row = conn.execute("""SELECT c.*, s.code AS station_code, s.direction AS station_direction
-                          FROM cases c JOIN stations s ON c.station_id=s.station_id
-                          WHERE c.case_id=?""", (case_id,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    r = sb().table("cases").select("*").eq("case_id", case_id).execute()
+    if not r.data:
+        return None
+    smap = _station_map()
+    return _attach_station(dict(r.data[0]), smap)
 
 
 def get_indicators(case_id):
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM indicators WHERE case_id=?", (case_id,)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    r = sb().table("indicators").select("*").eq("case_id", case_id).execute()
+    return r.data or []
 
 
 def get_indicators_grouped(case_id):
@@ -280,7 +187,12 @@ def get_indicators_grouped(case_id):
     return {k: "\n".join(v) for k, v in grouped.items()}
 
 
-# ---------- หัวใจ: เชื่อมโยงคดี (แยกตามกลุ่มคดี) ----------
+# ---------------- หัวใจ: เชื่อมโยงคดี ----------------
+def _all_indicators():
+    r = sb().table("indicators").select("*").execute()
+    return r.data or []
+
+
 def detect_links(case_id):
     me = get_case(case_id)
     if not me:
@@ -288,98 +200,97 @@ def detect_links(case_id):
     my_inds = get_indicators(case_id)
     if not my_inds:
         return []
-    conn = get_conn()
+    all_inds = _all_indicators()
+    cases = {c["case_id"]: c for c in get_cases()}   # มี station_code แล้ว
+
+    # เซ็ตของ (type, norm) ของคดีนี้
+    my_keys = {(i["indicator_type"], i["norm_value"]) for i in my_inds}
     linked = {}
-    for ind in my_inds:
-        rows = conn.execute("""
-            SELECT c.case_id, c.case_number, c.crime_type, c.lat, c.lng,
-                   s.code AS station_code, i.indicator_type, i.raw_value
-            FROM indicators i
-            JOIN cases c ON i.case_id=c.case_id
-            JOIN stations s ON c.station_id=s.station_id
-            WHERE i.indicator_type=? AND i.norm_value=?
-              AND i.case_id!=? AND c.category=?
-        """, (ind["indicator_type"], ind["norm_value"], case_id, me["category"])).fetchall()
-        for r in rows:
-            oid = r["case_id"]
-            if oid not in linked:
-                linked[oid] = {"case_id": oid, "case_number": r["case_number"],
-                               "station_code": r["station_code"], "crime_type": r["crime_type"],
-                               "lat": r["lat"], "lng": r["lng"], "shared": []}
-            linked[oid]["shared"].append({
-                "type": r["indicator_type"],
-                "label": INDICATOR_LABELS.get(r["indicator_type"], r["indicator_type"]),
-                "value": r["raw_value"]})
-    conn.close()
+    for ind in all_inds:
+        if ind["case_id"] == case_id:
+            continue
+        key = (ind["indicator_type"], ind["norm_value"])
+        if key not in my_keys:
+            continue
+        other = cases.get(ind["case_id"])
+        if not other or other["category"] != me["category"]:
+            continue
+        oid = ind["case_id"]
+        if oid not in linked:
+            linked[oid] = {"case_id": oid, "case_number": other["case_number"],
+                           "station_code": other["station_code"],
+                           "crime_type": other["crime_type"],
+                           "lat": other.get("lat"), "lng": other.get("lng"), "shared": []}
+        linked[oid]["shared"].append({
+            "type": ind["indicator_type"],
+            "label": INDICATOR_LABELS.get(ind["indicator_type"], ind["indicator_type"]),
+            "value": ind["raw_value"]})
     return list(linked.values())
 
 
 def get_all_link_pairs(category):
-    """คู่คดีที่เชื่อมโยงกันในกลุ่มที่ระบุ -> (case_id_a, case_id_b, จำนวนจุดร่วม)"""
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT a.case_id AS a_id, b.case_id AS b_id, COUNT(*) AS n
-        FROM indicators a
-        JOIN indicators b ON a.indicator_type=b.indicator_type
-                         AND a.norm_value=b.norm_value AND a.case_id<b.case_id
-        JOIN cases ca ON a.case_id=ca.case_id
-        JOIN cases cb ON b.case_id=cb.case_id
-        WHERE ca.category=? AND cb.category=?
-        GROUP BY a.case_id, b.case_id
-    """, (category, category)).fetchall()
-    conn.close()
-    return [(r["a_id"], r["b_id"], r["n"]) for r in rows]
+    all_inds = _all_indicators()
+    cases = {c["case_id"]: c for c in get_cases(category)}
+    # เก็บ case ต่อ (type, norm)
+    bucket = {}
+    for ind in all_inds:
+        if ind["case_id"] not in cases:
+            continue
+        bucket.setdefault((ind["indicator_type"], ind["norm_value"]), set()).add(ind["case_id"])
+    # นับจุดร่วมระหว่างคู่คดี
+    pair_count = {}
+    for cids in bucket.values():
+        cid_list = sorted(cids)
+        for i in range(len(cid_list)):
+            for j in range(i + 1, len(cid_list)):
+                pair_count[(cid_list[i], cid_list[j])] = pair_count.get((cid_list[i], cid_list[j]), 0) + 1
+    return [(a, b, n) for (a, b), n in pair_count.items()]
 
 
-# ---------- risk points ----------
+# ---------------- risk points ----------------
 def get_risk_points(category=None):
-    conn = get_conn()
+    q = sb().table("risk_points").select("*")
     if category:
-        rows = conn.execute("SELECT * FROM risk_points WHERE category=?", (category,)).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM risk_points").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+        q = q.eq("category", category)
+    return q.execute().data or []
 
 
 def add_risk_point(category, name, lat, lng, level="ปานกลาง", note=""):
-    conn = get_conn()
-    conn.execute("INSERT INTO risk_points(category,name,lat,lng,level,note) VALUES(?,?,?,?,?,?)",
-                 (category, name, lat, lng, level, note))
-    conn.commit()
-    conn.close()
+    sb().table("risk_points").insert({
+        "category": category, "name": name, "lat": lat, "lng": lng,
+        "level": level, "note": note}).execute()
 
 
 def save_risk_points(category, rows):
-    """บันทึกจุดเสี่ยงทั้งหมดของกลุ่ม (ใช้กับ data_editor): add/move/delete ในครั้งเดียว"""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM risk_points WHERE category=?", (category,))
+    client = sb()
+    client.table("risk_points").delete().eq("category", category).execute()
+    payload = []
     for r in rows:
         if r.get("name") is None or r.get("lat") is None or r.get("lng") is None:
             continue
-        cur.execute("INSERT INTO risk_points(category,name,lat,lng,level,note) VALUES(?,?,?,?,?,?)",
-                    (category, r.get("name"), r.get("lat"), r.get("lng"),
-                     r.get("level", "ปานกลาง"), r.get("note", "")))
-    conn.commit()
-    conn.close()
+        payload.append({"category": category, "name": r.get("name"),
+                        "lat": r.get("lat"), "lng": r.get("lng"),
+                        "level": r.get("level", "ปานกลาง"), "note": r.get("note", "")})
+    if payload:
+        client.table("risk_points").insert(payload).execute()
 
 
-# ---------- สถิติ / วิเคราะห์ ----------
+# ---------------- สถิติ / วิเคราะห์ ----------------
 def risk_by_area(category):
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT area, COUNT(*) AS case_count,
-               COALESCE(SUM(severity),0) AS sev_sum,
-               COALESCE(SUM(damage_amount),0) AS total_damage
-        FROM cases WHERE category=? AND area IS NOT NULL AND area!=''
-        GROUP BY area""", (category,)).fetchall()
-    conn.close()
-    data = [dict(r) for r in rows]
+    cases = get_cases(category)
+    agg = {}
+    for c in cases:
+        area = c.get("area")
+        if not area:
+            continue
+        a = agg.setdefault(area, {"area": area, "case_count": 0, "sev_sum": 0, "total_damage": 0})
+        a["case_count"] += 1
+        a["sev_sum"] += (c.get("severity") or 1)
+        a["total_damage"] += (c.get("damage_amount") or 0)
+    data = list(agg.values())
     if not data:
         return []
     for d in data:
-        # คะแนนเสี่ยง = จำนวนคดี + ความรุนแรงรวม (ถ่วงน้ำหนัก)
         d["score"] = d["case_count"] + d["sev_sum"]
     mx = max(d["score"] for d in data)
     for d in data:
@@ -390,28 +301,41 @@ def risk_by_area(category):
 
 
 def get_dashboard_stats():
-    conn = get_conn()
-    def one(q, p=()):
-        return conn.execute(q, p).fetchone()[0]
-    stats = {
-        "cyber_cases": one("SELECT COUNT(*) FROM cases WHERE category='cyber'"),
-        "physical_cases": one("SELECT COUNT(*) FROM cases WHERE category='physical'"),
-        "total_damage": one("SELECT COALESCE(SUM(damage_amount),0) FROM cases WHERE category='cyber'"),
-        "total_indicators": one("SELECT COUNT(*) FROM indicators"),
+    cases = get_cases()
+    cyber = [c for c in cases if c["category"] == "cyber"]
+    physical = [c for c in cases if c["category"] == "physical"]
+    return {
+        "cyber_cases": len(cyber),
+        "physical_cases": len(physical),
+        "total_damage": sum(c.get("damage_amount") or 0 for c in cyber),
+        "total_indicators": len(_all_indicators()),
+        "cyber_links": len(get_all_link_pairs("cyber")),
+        "physical_links": len(get_all_link_pairs("physical")),
     }
-    conn.close()
-    stats["cyber_links"] = len(get_all_link_pairs("cyber"))
-    stats["physical_links"] = len(get_all_link_pairs("physical"))
-    return stats
 
 
 def get_top_reused_indicators(category, limit=8):
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT i.indicator_type, i.raw_value, COUNT(DISTINCT i.case_id) AS used
-        FROM indicators i JOIN cases c ON i.case_id=c.case_id
-        WHERE c.category=?
-        GROUP BY i.indicator_type, i.norm_value
-        HAVING used>1 ORDER BY used DESC LIMIT ?""", (category, limit)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    all_inds = _all_indicators()
+    cases = {c["case_id"] for c in get_cases(category)}
+    bucket = {}
+    for ind in all_inds:
+        if ind["case_id"] not in cases:
+            continue
+        key = (ind["indicator_type"], ind["norm_value"])
+        b = bucket.setdefault(key, {"indicator_type": ind["indicator_type"],
+                                    "raw_value": ind["raw_value"], "cases": set()})
+        b["cases"].add(ind["case_id"])
+    result = [{"indicator_type": b["indicator_type"], "raw_value": b["raw_value"],
+               "used": len(b["cases"])} for b in bucket.values() if len(b["cases"]) > 1]
+    result.sort(key=lambda x: x["used"], reverse=True)
+    return result[:limit]
+
+
+# ---------------- โครงสร้างพื้นฐาน (สถานี+ขอบเขต) ----------------
+def stations_empty():
+    return len(get_stations()) == 0
+
+
+def cases_empty():
+    r = sb().table("cases").select("case_id").limit(1).execute()
+    return not r.data
