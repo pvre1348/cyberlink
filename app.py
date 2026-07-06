@@ -52,9 +52,10 @@ CSS = """
 html,body,[class*="css"]{font-family:'IBM Plex Sans Thai',sans-serif;}
 h1,h2,h3,h4,h5{font-family:'Prompt',sans-serif;color:var(--text-1);letter-spacing:.2px;}
 .stApp{background:var(--ink-2);}
-.block-container{padding-top:1rem;padding-bottom:3rem;max-width:1340px;}
+.block-container{padding-top:4.5rem;padding-bottom:3rem;max-width:1340px;}
+header[data-testid="stHeader"]{background:transparent !important;}
 .esri-topbar{background:var(--ink-0);border-bottom:3px solid var(--esri);padding:12px 22px;
-  margin:-1rem -1rem 20px;display:flex;align-items:center;gap:14px;}
+  margin:0 0 18px;border-radius:10px;display:flex;align-items:center;gap:14px;}
 .esri-topbar .logo{width:26px;height:26px;background:var(--esri);border-radius:4px;
   display:flex;align-items:center;justify-content:center;color:#fff;}
 .esri-topbar .title{color:#fff;font-weight:500;font-size:15px;font-family:'Prompt';}
@@ -91,7 +92,7 @@ section[data-testid="stSidebar"] *{color:var(--text-1);}
 .guide-step{display:inline-block;background:var(--esri);color:#fff;width:22px;height:22px;border-radius:50%;
   text-align:center;font-weight:600;font-size:.85rem;margin-right:8px;}
 .hint{color:var(--text-2);font-size:.88rem;margin:-6px 0 12px 12px;}
-.login-box{max-width:420px;margin:4vh auto 0;background:var(--ink-1);border:1px solid var(--line);
+.login-box{max-width:420px;margin:3vh auto 0;background:var(--ink-1);border:1px solid var(--line);
   border-radius:14px;padding:26px 28px;border-top:4px solid var(--esri);}
 .login-box h2{color:#fff;margin:0 0 4px;}
 </style>
@@ -247,8 +248,17 @@ def case_form(category, prefill=None, key="form", submit_label="บันทึ�
         crime_type_sel = c4.selectbox("ประเภทคดี *", types, index=type_idx)
         crime_custom = c5.text_input("ถ้าเลือก 'อื่น ๆ' ให้ระบุที่นี่",
                                      value=cur_type if cur_type not in types else "")
-        c6, c7 = st.columns(2)
-        area = c6.text_input("พื้นที่ (ตำบล/เขต/ย่าน)", value=p.get("area", "") or "")
+
+        # พื้นที่/ย่าน: เลือกจากรายการมาตรฐาน (แก้ปัญหาพิมพ์ชื่อย่านไม่ตรงกัน)
+        nb_list = db.get_neighborhoods()
+        area_options = nb_list + [OTHER]
+        cur_area = (p.get("area") or "").strip()
+        area_idx = nb_list.index(cur_area) if cur_area in nb_list else (
+            len(area_options) - 1 if cur_area else 0)
+        c6, c6b, c7 = st.columns(3)
+        area_sel = c6.selectbox("พื้นที่/ย่าน", area_options, index=area_idx)
+        area_custom = c6b.text_input("ถ้าเลือก 'อื่น ๆ' ระบุย่านที่นี่",
+                                     value=cur_area if cur_area not in nb_list else "")
         location_detail = c7.text_input("จุดเกิดเหตุ (ถนน/ซอย)", value=p.get("location_detail", "") or "")
 
         victim_name = damage = time_bucket = weapon = severity = ""
@@ -277,6 +287,12 @@ def case_form(category, prefill=None, key="form", submit_label="บันทึ�
         submitted = st.form_submit_button(submit_label, use_container_width=True)
 
     crime_type = crime_custom.strip() if (crime_type_sel == OTHER and crime_custom.strip()) else crime_type_sel
+    # ประกอบค่า area: เลือกจากรายการ หรือค่าที่ระบุเองในช่อง 'อื่น ๆ'
+    # (คดีเก่าที่ค่าไม่อยู่ในรายการ จะถูกเติมในช่องระบุเองให้อัตโนมัติ — ค่าเดิมไม่หาย)
+    if area_sel == OTHER:
+        area_val = area_custom.strip() if area_custom.strip() else cur_area
+    else:
+        area_val = area_sel
     indicators = []
     for t, txt in ind_inputs.items():
         for v in parse_lines(txt):
@@ -287,7 +303,7 @@ def case_form(category, prefill=None, key="form", submit_label="บันทึ�
     data = dict(category=category, case_number=case_number.strip(),
                 station_id=dict(zip(st_labels, st_ids))[station_label],
                 crime_type=crime_type, report_date=str(report_date),
-                time_bucket=time_bucket or "", area=area.strip(),
+                time_bucket=time_bucket or "", area=area_val.strip(),
                 location_detail=location_detail.strip(), lat=lat, lng=lng,
                 victim_name=(victim_name or "").strip(), damage_amount=float(damage or 0),
                 weapon=(weapon or "").strip(), severity=int(severity or 1),
@@ -416,42 +432,101 @@ def page_manage_cases():
 
 def page_online_map():
     section_title("🌐 แผนผังคดีออนไลน์ — สำหรับมวลชนสัมพันธ์")
-    hint("จุด=คดี · เส้นส้ม=คดีที่ใช้จุดร่วมเดียวกัน (บัญชี/ไลน์/เบอร์)")
+    hint("จุดน้ำเงิน = คดีออนไลน์ · ใช้ดูว่าควรไปเตือนภัย/ให้ความรู้ประชาชนที่พื้นที่ใด "
+         "(ดูเส้นเชื่อมโยงคดีได้ที่เมนู 'แผนที่เชื่อมโยงคดี')")
     cases = db.get_cases(CAT_ONLINE)
-    pairs = db.get_all_link_pairs(CAT_ONLINE)
     if HAS_MAP:
-        m = map_view.build_cyber_map(db.get_stations(), cases, pairs, db.get_boundaries())
+        # ส่ง pairs=[] เพื่อไม่วาดเส้นเชื่อม — เส้นเชื่อมย้ายไปหน้าแผนที่เชื่อมโยงคดี
+        m = map_view.build_cyber_map(db.get_stations(), cases, [], db.get_boundaries())
         st_folium(m, width=None, height=520, returned_objects=[])
     else:
         st.warning("ยังไม่ได้ติดตั้งแผนที่")
-    st.divider(); section_title("คู่คดีที่เชื่อมโยง")
-    byid = {c["case_id"]: c for c in cases}
-    for a, b, n in pairs:
-        st.markdown(f'🔗 **{byid[a]["case_number"]}** ({byid[a]["station_code"]}) — '
-                    f'**{byid[b]["case_number"]}** ({byid[b]["station_code"]}) · {n} จุดร่วม')
+    st.divider()
+    section_title("ระดับความเสี่ยงรายย่าน (คดีออนไลน์)")
+    hint("เกณฑ์: ≤3 คดี = ต่ำ · 4-5 คดี = ปานกลาง · >5 คดี = สูง")
+    for d in db.risk_by_area(CAT_ONLINE):
+        c1, c2, c3 = st.columns([2, 1, 1.3])
+        c1.write(d["area"]); c2.write(f'{d["case_count"]} คดี')
+        c3.markdown(risk_badge(d["risk_level"]), unsafe_allow_html=True)
 
 
 def page_patrol_map():
     section_title("🚔 แผนผังสายตรวจ — คดีในพื้นที่")
-    hint("วงสี=จุดเสี่ยง (แดง=สูง ส้ม=กลาง เขียว=ต่ำ) · จุดแดง=คดี · เส้นประ=เชื่อมโยงข้ามพื้นที่")
+    hint("วงสี = พื้นที่เสี่ยงจับกลุ่มอัตโนมัติจากจุดเกิดเหตุจริง "
+         "(เขียว ≤3 · เหลือง 4-5 · แดง >5 คดี) · จุดแดงเล็ก = คดี · "
+         "หมุดสามเหลี่ยม = จุดเสี่ยงที่เจ้าหน้าที่บันทึกเอง · ไม่มีเส้นเชื่อมในหน้านี้")
     cases = db.get_cases(CAT_PHYSICAL)
-    tb = st.selectbox("กรองตามช่วงเวลาเกิดเหตุ (ช่วยจัดผลัดสายตรวจ)", ["ทั้งหมด"] + TIME_BUCKETS)
+
+    c1, c2 = st.columns([1, 1.2])
+    tb = c1.selectbox("กรองตามช่วงเวลาเกิดเหตุ (ช่วยจัดผลัดสายตรวจ)",
+                      ["ทั้งหมด"] + TIME_BUCKETS)
+    radius = c2.slider("รัศมีจับกลุ่มพื้นที่เสี่ยง (เมตร)", 200, 1000, 400, step=50)
+
     if tb != "ทั้งหมด":
         cases = [c for c in cases if c.get("time_bucket") == tb]
-    pairs = db.get_all_link_pairs(CAT_PHYSICAL)
-    ids = {c["case_id"] for c in cases}
-    pairs = [(a, b, n) for a, b, n in pairs if a in ids and b in ids]
+
+    # จับกลุ่มจากคดีที่ผ่านตัวกรองแล้ว — ตัวกรองเวลาจึงมีผลกับวงสีด้วย
+    clusters = map_view.cluster_cases(cases, radius)
+
     if HAS_MAP:
-        m = map_view.build_physical_map(db.get_stations(), cases,
-                                        db.get_risk_points(CAT_PHYSICAL), pairs, db.get_boundaries())
+        m = map_view.build_patrol_map(db.get_stations(), cases, clusters,
+                                      db.get_risk_points(CAT_PHYSICAL),
+                                      db.get_boundaries())
         st_folium(m, width=None, height=520, returned_objects=[])
     else:
         st.warning("ยังไม่ได้ติดตั้งแผนที่")
-    st.divider(); section_title("ระดับความเสี่ยงรายพื้นที่")
+
+    st.divider()
+    section_title(f"สรุปกลุ่มพื้นที่เสี่ยง (รัศมี {radius} ม.)")
+    if clusters:
+        for cl in clusters:
+            lv = map_view.cluster_level(cl["count"])
+            nums = ", ".join(c["case_number"] for c in cl["cases"][:6])
+            more = "" if cl["count"] <= 6 else f" +{cl['count']-6}"
+            cA, cB, cC = st.columns([1, 3, 1.3])
+            cA.write(f'{cl["count"]} คดี')
+            cB.write(f'{nums}{more}')
+            cC.markdown(risk_badge(lv), unsafe_allow_html=True)
+    else:
+        st.info("ยังไม่มีคดีที่มีพิกัดในช่วงเวลาที่เลือก")
+
+    st.divider()
+    section_title("ระดับความเสี่ยงรายย่าน (จากชื่อย่านที่บันทึก)")
+    hint("เกณฑ์: ≤3 คดี = ต่ำ · 4-5 คดี = ปานกลาง · >5 คดี = สูง")
     for d in db.risk_by_area(CAT_PHYSICAL):
         c1, c2, c3 = st.columns([2, 1, 1.3])
         c1.write(d["area"]); c2.write(f'{d["case_count"]} คดี')
         c3.markdown(risk_badge(d["risk_level"]), unsafe_allow_html=True)
+
+
+def page_linkage_map():
+    section_title("🔗 แผนที่เชื่อมโยงคดี")
+    hint("เส้นส้ม = คดีที่ใช้จุดร่วมเดียวกัน (บัญชี/ไลน์/เบอร์/ทะเบียนรถ/ลักษณะคนร้าย) · "
+         "เส้นหนา = จุดร่วมตรงกันหลายรายการ · หน้านี้ไม่แสดงวงพื้นที่เสี่ยงเพื่อไม่ให้ตาลาย")
+    grp = st.radio("เลือกกลุ่มคดี", ["คดีออนไลน์", "คดีในพื้นที่"], horizontal=True)
+    cat = CAT_ONLINE if grp == "คดีออนไลน์" else CAT_PHYSICAL
+    dot = "#25406B" if cat == CAT_ONLINE else "#B3434F"
+
+    cases = db.get_cases(cat)
+    pairs = db.get_all_link_pairs(cat)
+
+    if HAS_MAP:
+        m = map_view.build_linkage_map(db.get_stations(), cases, pairs,
+                                       db.get_boundaries(), dot_color=dot)
+        st_folium(m, width=None, height=520, returned_objects=[])
+    else:
+        st.warning("ยังไม่ได้ติดตั้งแผนที่")
+
+    st.divider()
+    section_title("รายการคู่คดีที่เชื่อมโยง")
+    byid = {c["case_id"]: c for c in cases}
+    if pairs:
+        for a, b, n in pairs:
+            if a in byid and b in byid:
+                st.markdown(f'🔗 **{byid[a]["case_number"]}** ({byid[a]["station_code"]}) — '
+                            f'**{byid[b]["case_number"]}** ({byid[b]["station_code"]}) · {n} จุดร่วม')
+    else:
+        st.info("ยังไม่มีคู่คดีที่เชื่อมโยงในกลุ่มนี้")
 
 
 def page_manage_area():
@@ -567,7 +642,7 @@ def page_guide():
 
 def page_admin():
     section_title("🛠️ ผู้ดูแลระบบ")
-    tab_inv, tab_usr, tab_data = st.tabs(["รหัสเชิญ", "ผู้ใช้", "ข้อมูลระบบ"])
+    tab_inv, tab_usr, tab_nb, tab_data = st.tabs(["รหัสเชิญ", "ผู้ใช้", "ย่าน/พื้นที่", "ข้อมูลระบบ"])
     u = current_user()
 
     with tab_inv:
@@ -612,6 +687,19 @@ def page_admin():
                             auth.delete_user(target["id"]); st.success("ลบแล้ว"); st.rerun()
                 else:
                     st.caption("ลบบัญชีตัวเองไม่ได้")
+
+    with tab_nb:
+        st.caption("รายการย่านมาตรฐานที่แสดงใน dropdown ตอนบันทึกคดี — เพิ่ม/แก้/ลบได้ แล้วกดบันทึก "
+                   "(ช่วยแก้ปัญหาเจ้าหน้าที่พิมพ์ชื่อย่านไม่ตรงกัน)")
+        nb = db.get_neighborhoods()
+        nb_df = pd.DataFrame({"ชื่อย่าน": nb})
+        edited_nb = st.data_editor(nb_df, num_rows="dynamic", use_container_width=True,
+                                   key="nb_editor")
+        if st.button("💾 บันทึกรายการย่าน"):
+            items = [str(x).strip() for x in edited_nb["ชื่อย่าน"].tolist() if str(x).strip()]
+            db.save_neighborhoods(items)
+            st.success("บันทึกรายการย่านแล้ว"); st.rerun()
+        st.caption("หมายเหตุ: การแก้ไขรายการนี้ไม่กระทบข้อมูลย่านที่บันทึกในคดีเดิม")
 
     with tab_data:
         st.caption("จัดการชุดข้อมูลตัวอย่างสำหรับการนำเสนอ")
@@ -665,6 +753,7 @@ def main():
         "จัดการคดี": ("✏️ จัดการ/แก้ไขคดี", page_manage_cases),
         "แผนผังออนไลน์": ("🌐 แผนผังคดีออนไลน์", page_online_map),
         "แผนผังสายตรวจ": ("🚔 แผนผังสายตรวจ", page_patrol_map),
+        "แผนที่เชื่อมโยง": ("🔗 แผนที่เชื่อมโยงคดี", page_linkage_map),
         "ค้นหา": ("🔍 ค้นหาจุดร่วม", page_search),
     }
     if is_admin():

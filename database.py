@@ -5,6 +5,7 @@ database.py — ชั้นข้อมูลของ CyberLink (เวอร�
 """
 import re
 import json
+from difflib import SequenceMatcher
 
 import supa
 
@@ -45,6 +46,20 @@ def normalize_value(indicator_type, value):
     return re.sub(r"\s+", " ", v).strip().lower()
 
 
+# ---------------- fuzzy matching (สำหรับข้อความอิสระ เช่น ลักษณะคนร้าย) ----------------
+# ชนิดจุดร่วมที่ใช้การเทียบแบบใกล้เคียงแทนการเทียบตรงตัว
+FUZZY_TYPES = {"suspect_desc"}
+FUZZY_THRESHOLD = 0.82   # ความคล้ายขั้นต่ำ (0-1) ~82%
+
+
+def _similar(a, b):
+    """เทียบความคล้ายของข้อความ 2 ชุดด้วย SequenceMatcher
+    เช่น 'ชายผอมสูง สวมหมวก' กับ 'ชายผอมสูง หมวก' -> ~0.90 ถือว่าตรงกัน"""
+    if not a or not b:
+        return False
+    return SequenceMatcher(None, a, b).ratio() >= FUZZY_THRESHOLD
+
+
 # ---------------- settings / boundaries ----------------
 def set_setting(key, value):
     sb().table("settings").upsert({"key": key, "value": value}).execute()
@@ -79,6 +94,36 @@ def get_boundary():
 def set_boundary(polygons):
     set_boundaries([{"code": f"พื้นที่ {i+1}", "name": "", "is_main": 0, "polygon": p}
                     for i, p in enumerate(polygons)])
+
+
+# ---------------- รายการย่านมาตรฐาน (เก็บใน settings — ไม่แก้ schema) ----------------
+DEFAULT_NEIGHBORHOODS = [
+    "ลุมพินี", "วิทยุ", "เพลินจิต", "ชิดลม", "ราชประสงค์",
+    "ราชดำริ", "หลังสวน", "ต้นสน", "สารสิน", "ร่วมฤดี", "พระราม 4 (ฝั่งเหนือ)",
+]
+
+
+def get_neighborhoods():
+    """คืนรายการย่านมาตรฐานสำหรับ dropdown (ถ้ายังไม่เคยบันทึก ใช้ค่าตั้งต้น)"""
+    raw = get_setting("neighborhoods")
+    if raw:
+        try:
+            lst = json.loads(raw)
+            if lst:
+                return lst
+        except Exception:
+            pass
+    return list(DEFAULT_NEIGHBORHOODS)
+
+
+def save_neighborhoods(items):
+    """บันทึกรายการย่าน (ตัดค่าว่าง/ซ้ำออก คงลำดับเดิม)"""
+    clean = []
+    for x in items:
+        x = (x or "").strip()
+        if x and x not in clean:
+            clean.append(x)
+    set_setting("neighborhoods", json.dumps(clean, ensure_ascii=False))
 
 
 # ---------------- stations ----------------
@@ -203,19 +248,18 @@ def detect_links(case_id):
     all_inds = _all_indicators()
     cases = {c["case_id"]: c for c in get_cases()}   # มี station_code แล้ว
 
-    # เซ็ตของ (type, norm) ของคดีนี้
-    my_keys = {(i["indicator_type"], i["norm_value"]) for i in my_inds}
+    # แยกจุดร่วมของคดีนี้: แบบเทียบตรงตัว vs แบบเทียบใกล้เคียง (fuzzy)
+    my_exact = {(i["indicator_type"], i["norm_value"])
+                for i in my_inds if i["indicator_type"] not in FUZZY_TYPES}
+    my_fuzzy = [i for i in my_inds if i["indicator_type"] in FUZZY_TYPES]
+
     linked = {}
-    for ind in all_inds:
-        if ind["case_id"] == case_id:
-            continue
-        key = (ind["indicator_type"], ind["norm_value"])
-        if key not in my_keys:
-            continue
-        other = cases.get(ind["case_id"])
-        if not other or other["category"] != me["category"]:
-            continue
+
+    def add_match(ind):
         oid = ind["case_id"]
+        other = cases.get(oid)
+        if not other or other["category"] != me["category"]:
+            return
         if oid not in linked:
             linked[oid] = {"case_id": oid, "case_number": other["case_number"],
                            "station_code": other["station_code"],
@@ -225,25 +269,55 @@ def detect_links(case_id):
             "type": ind["indicator_type"],
             "label": INDICATOR_LABELS.get(ind["indicator_type"], ind["indicator_type"]),
             "value": ind["raw_value"]})
+
+    for ind in all_inds:
+        if ind["case_id"] == case_id:
+            continue
+        t = ind["indicator_type"]
+        if t in FUZZY_TYPES:
+            # เทียบแบบใกล้เคียงกับจุดร่วม fuzzy ของคดีนี้ทุกตัว
+            for mine in my_fuzzy:
+                if mine["indicator_type"] == t and _similar(mine["norm_value"], ind["norm_value"]):
+                    add_match(ind)
+                    break
+        elif (t, ind["norm_value"]) in my_exact:
+            add_match(ind)
     return list(linked.values())
 
 
 def get_all_link_pairs(category):
     all_inds = _all_indicators()
-    cases = {c["case_id"]: c for c in get_cases(category)}
-    # เก็บ case ต่อ (type, norm)
-    bucket = {}
-    for ind in all_inds:
-        if ind["case_id"] not in cases:
-            continue
-        bucket.setdefault((ind["indicator_type"], ind["norm_value"]), set()).add(ind["case_id"])
-    # นับจุดร่วมระหว่างคู่คดี
+    case_ids = {c["case_id"] for c in get_cases(category)}
+    exact = [i for i in all_inds
+             if i["case_id"] in case_ids and i["indicator_type"] not in FUZZY_TYPES]
+    fuzzy = [i for i in all_inds
+             if i["case_id"] in case_ids and i["indicator_type"] in FUZZY_TYPES]
+
     pair_count = {}
+
+    # 1) จับคู่แบบตรงตัว: เก็บ case ต่อ (type, norm)
+    bucket = {}
+    for ind in exact:
+        bucket.setdefault((ind["indicator_type"], ind["norm_value"]), set()).add(ind["case_id"])
     for cids in bucket.values():
-        cid_list = sorted(cids)
-        for i in range(len(cid_list)):
-            for j in range(i + 1, len(cid_list)):
-                pair_count[(cid_list[i], cid_list[j])] = pair_count.get((cid_list[i], cid_list[j]), 0) + 1
+        lst = sorted(cids)
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                key = (lst[i], lst[j])
+                pair_count[key] = pair_count.get(key, 0) + 1
+
+    # 2) จับคู่แบบใกล้เคียง (fuzzy) สำหรับลักษณะคนร้าย: เทียบทีละคู่
+    for i in range(len(fuzzy)):
+        for j in range(i + 1, len(fuzzy)):
+            a, b = fuzzy[i], fuzzy[j]
+            if a["case_id"] == b["case_id"]:
+                continue
+            if a["indicator_type"] != b["indicator_type"]:
+                continue
+            if _similar(a["norm_value"], b["norm_value"]):
+                key = tuple(sorted((a["case_id"], b["case_id"])))
+                pair_count[key] = pair_count.get(key, 0) + 1
+
     return [(a, b, n) for (a, b), n in pair_count.items()]
 
 
@@ -276,6 +350,16 @@ def save_risk_points(category, rows):
 
 
 # ---------------- สถิติ / วิเคราะห์ ----------------
+def level_for_count(n):
+    """เกณฑ์ระดับความเสี่ยงตัวเลขตายตัว (ตรงกับสีวงบนแผนที่)
+    ≤3 คดี = ต่ำ | 4-5 คดี = ปานกลาง | >5 คดี = สูง"""
+    if n > 5:
+        return "สูง"
+    if n >= 4:
+        return "ปานกลาง"
+    return "ต่ำ"
+
+
 def risk_by_area(category):
     cases = get_cases(category)
     agg = {}
@@ -290,13 +374,10 @@ def risk_by_area(category):
     data = list(agg.values())
     if not data:
         return []
+    # ใช้เกณฑ์ตัวเลขตายตัว (เลิกเทียบสัมพัทธ์กับพื้นที่ที่มีคดีมากสุด)
     for d in data:
-        d["score"] = d["case_count"] + d["sev_sum"]
-    mx = max(d["score"] for d in data)
-    for d in data:
-        ratio = d["score"] / mx if mx else 0
-        d["risk_level"] = "สูง" if ratio >= 0.66 else ("ปานกลาง" if ratio >= 0.33 else "ต่ำ")
-    data.sort(key=lambda d: d["score"], reverse=True)
+        d["risk_level"] = level_for_count(d["case_count"])
+    data.sort(key=lambda d: d["case_count"], reverse=True)
     return data
 
 
